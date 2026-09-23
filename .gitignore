@@ -1,0 +1,34 @@
+.venv/
+__pycache__/
+.pytest_cache/
+advisor.db
+
+# Local configuration, secrets, and private key material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Databases and SQLite sidecar files can contain client information.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local tooling and generated outputs.
+venv/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.py[cod]
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

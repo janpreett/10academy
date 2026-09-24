@@ -1,3 +1,5 @@
+"""Check that paging returns each starting record once, in the right order."""
+
 import base64
 from contextlib import closing
 from datetime import datetime
@@ -9,6 +11,7 @@ from app.db import connect, init_db
 
 @pytest.fixture
 def history(db_path):
+    """Create 123 records with shared timestamps and return their expected order."""
     # More than two default pages, with many equal timestamps.
     with closing(connect(db_path)) as connection:
         records = []
@@ -25,6 +28,7 @@ def history(db_path):
 
 
 def test_default_pages_and_last_cursor(client, history):
+    """Default pages should contain 50, 50, then 23 records, with no fourth page."""
     response = client.get("/accounts/ACC-1001/transactions")
     assert response.status_code == 200
     page = response.json()
@@ -43,6 +47,7 @@ def test_default_pages_and_last_cursor(client, history):
 
 @pytest.mark.parametrize("limit", [1, 10, 100])
 def test_page_limits_with_timestamp_ties(client, history, limit):
+    """Different page sizes must not skip or repeat records with matching times."""
     parameters = {"limit": limit}
     ids = []
     for _ in range(124):
@@ -62,10 +67,12 @@ def test_page_limits_with_timestamp_ties(client, history, limit):
 
 @pytest.mark.parametrize("limit", ["0", "-1", "101", "1.5", "bad", ""])
 def test_invalid_limits(client, limit):
+    """Reject page sizes outside 1 to 100 and inputs that are not whole numbers."""
     assert client.get("/accounts/ACC-1001/transactions", params={"limit": limit}).status_code == 422
 
 
 def test_exact_full_final_page_has_no_cursor(client, history):
+    """A full page still needs a null cursor when there are no records after it."""
     # IDs 111 through 120 are on day 12, exactly filling a ten-item page.
     response = client.get(
         "/accounts/ACC-1001/transactions", params={"from": "2026-08-12", "to": "2026-08-12", "limit": 10}
@@ -76,6 +83,7 @@ def test_exact_full_final_page_has_no_cursor(client, history):
 
 
 def test_inserts_between_pages_do_not_shift_snapshot(client, db_path, history):
+    """New and backdated inserts must stay out of a page sequence already started."""
     first = client.get("/accounts/ACC-1001/transactions", params={"limit": 7}).json()
     ids = [item["id"] for item in first["items"]]
     with closing(connect(db_path)) as connection:
@@ -103,6 +111,7 @@ def test_inserts_between_pages_do_not_shift_snapshot(client, db_path, history):
 
 
 def test_filters_are_preserved_through_every_page(client, history):
+    """Every page must keep the original date and transaction-type filters."""
     parameters = {"from": "2026-08-03", "to": "2026-08-08", "type": "deposit", "limit": 7}
     ids = []
     for _ in range(10):
@@ -119,13 +128,16 @@ def test_filters_are_preserved_through_every_page(client, history):
 
 @pytest.mark.parametrize("cursor", ["", "bad", "a.b.c", "☃", "x" * 4097, "e30.e30"])
 def test_invalid_cursor_returns_400(client, cursor):
+    """Reject empty, malformed, and oversized cursors with the required 400 status."""
     assert client.get("/accounts/ACC-1001/transactions", params={"cursor": cursor}).status_code == 400
 
 
 def test_tampered_cursor_is_rejected(client, history):
+    """Changing the saved record limit without a valid signature must fail."""
     cursor = client.get("/accounts/ACC-1001/transactions").json()["next_cursor"]
     payload, signature = cursor.split(".")
     raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    # Change the readable payload but keep the old signature to simulate tampering.
     changed = raw.replace(b'"snapshot_id":123', b'"snapshot_id":124')
     assert changed != raw
     tampered = base64.urlsafe_b64encode(changed).rstrip(b"=").decode() + "." + signature
@@ -134,17 +146,20 @@ def test_tampered_cursor_is_rejected(client, history):
 
 @pytest.mark.parametrize("changes", [{"from": "2026-08-02"}, {"to": "2026-08-12"}, {"type": "deposit"}])
 def test_cursor_cannot_change_filters(client, history, changes):
+    """A cursor from one search cannot be reused with different filters."""
     cursor = client.get("/accounts/ACC-1001/transactions").json()["next_cursor"]
     assert client.get("/accounts/ACC-1001/transactions", params={"cursor": cursor, **changes}).status_code == 400
 
 
 def test_cursor_cannot_change_account(client, history):
+    """A cursor belongs to one account and cannot be used for another account."""
     cursor = client.get("/accounts/ACC-1001/transactions").json()["next_cursor"]
     assert client.get("/accounts/ACC-1002/transactions", params={"cursor": cursor}).status_code == 400
     assert client.get("/accounts/missing/transactions", params={"cursor": cursor}).status_code == 404
 
 
 def test_cursor_replay_and_database_reinitialization(client, db_path, history):
+    """Running database setup again must keep the signing key and existing cursors."""
     cursor = client.get("/accounts/ACC-1001/transactions").json()["next_cursor"]
     parameters = {"cursor": cursor}
     expected = client.get("/accounts/ACC-1001/transactions", params=parameters).json()
@@ -156,6 +171,7 @@ def test_cursor_replay_and_database_reinitialization(client, db_path, history):
 
 
 def test_utc_timestamp_formats_and_microseconds_page_in_time_order(client, db_path):
+    """Compare actual UTC times rather than sorting their different text formats."""
     timestamps = [
         "2026-08-01T12:00:00.000001+00:00",
         "2026-08-01T12:00:00Z",
@@ -174,6 +190,7 @@ def test_utc_timestamp_formats_and_microseconds_page_in_time_order(client, db_pa
             ).lastrowid
             records.append((record_id, timestamp))
         connection.commit()
+    # Python parses the times independently of the SQL used by the endpoint.
     expected = sorted(records, key=lambda item: (datetime.fromisoformat(item[1]), item[0]), reverse=True)
     parameters = {"limit": 2}
     actual = []

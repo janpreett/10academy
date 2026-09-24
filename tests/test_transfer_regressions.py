@@ -1,4 +1,4 @@
-"""Regression coverage for precision and persistent retry handling."""
+"""Check that the money and retry bugs stay fixed."""
 
 import sqlite3
 from contextlib import closing
@@ -10,6 +10,7 @@ from app.db import connect
 
 
 def submit_transfer(client, amount, key=None, source="ACC-1001", destination="ACC-1002"):
+    """Send a transfer request, optionally marking it with a retry key."""
     headers = {"Idempotency-Key": key} if key is not None else {}
     return client.post(
         "/transfers",
@@ -19,6 +20,7 @@ def submit_transfer(client, amount, key=None, source="ACC-1001", destination="AC
 
 
 def test_transfer_response_uses_two_decimal_places(client):
+    """Keep the response fields unchanged and format both balances as money."""
     response = submit_transfer(client, 250)
 
     assert response.status_code == 201
@@ -28,6 +30,7 @@ def test_transfer_response_uses_two_decimal_places(client):
 
 
 def test_repeated_small_transfers_preserve_stored_balances(client, db_path):
+    """Ten ten-cent transfers should move exactly one dollar in the database."""
     for _ in range(10):
         assert submit_transfer(client, 0.10).status_code == 201
 
@@ -42,6 +45,7 @@ def test_repeated_small_transfers_preserve_stored_balances(client, db_path):
 
 
 def test_retry_returns_original_response_after_other_transfers(client, db_path):
+    """A retry must return its old result even after another transfer changes balances."""
     original = submit_transfer(client, 100, key="original-transfer")
     assert original.status_code == 201
     assert submit_transfer(client, 50).status_code == 201
@@ -65,6 +69,7 @@ def test_retry_returns_original_response_after_other_transfers(client, db_path):
 def test_retry_key_cannot_be_reused_for_different_transfer(
     client, db_path, amount, source, destination
 ):
+    """Reject changed amounts or accounts when the caller reuses a saved key."""
     original = submit_transfer(client, 100, key="used-key")
     assert original.status_code == 201
 
@@ -80,6 +85,7 @@ def test_retry_key_cannot_be_reused_for_different_transfer(
 
 
 def test_transfers_without_key_are_independent(client, db_path):
+    """Without a retry key, two equal requests are two separate transfers."""
     first = submit_transfer(client, 100)
     second = submit_transfer(client, 100)
 
@@ -91,6 +97,8 @@ def test_transfers_without_key_are_independent(client, db_path):
 
 
 def test_failed_idempotency_record_rolls_back_transfer(client, db_path):
+    """If saving the retry record fails, undo the balances and all transfer rows."""
+    # This trigger makes the last write fail so we can check earlier writes were undone.
     with closing(connect(db_path)) as connection:
         connection.execute(
             """

@@ -1,3 +1,5 @@
+"""Check invalid inputs, failed writes, and transfers arriving together."""
+
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -10,6 +12,7 @@ from app.main import app
 
 
 def transfer(client, amount=100, source="ACC-1001", destination="ACC-1002", key=None):
+    """Send a transfer using the same starting accounts unless a test overrides them."""
     return client.post(
         "/transfers",
         json={"from_account": source, "to_account": destination, "amount": amount},
@@ -18,6 +21,7 @@ def transfer(client, amount=100, source="ACC-1001", destination="ACC-1002", key=
 
 
 def ledger_state(db_path):
+    """Read balances and saved rows so tests can detect any unwanted database change."""
     with closing(connect(db_path)) as connection:
         return {
             "balances": [tuple(row) for row in connection.execute(
@@ -40,6 +44,7 @@ def ledger_state(db_path):
     "1000000000000.00", "1e1000", "1e-1000",
 ])
 def test_invalid_amount_changes_nothing(client, db_path, amount):
+    """Reject invalid money values before changing balances or saving any rows."""
     before = ledger_state(db_path)
     assert transfer(client, amount, key="invalid-amount").status_code == 422
     assert ledger_state(db_path) == before
@@ -47,7 +52,9 @@ def test_invalid_amount_changes_nothing(client, db_path, amount):
 
 @pytest.mark.parametrize("amount_literal", ["NaN", "Infinity", "-Infinity", "1e999"])
 def test_nonfinite_json_number_is_a_validation_error(client, db_path, amount_literal):
+    """Return 422 for non-finite numbers instead of failing while building an error."""
     before = ledger_state(db_path)
+    # Send raw text because the test client's normal JSON encoder rejects these values.
     response = client.post(
         "/transfers",
         content='{"from_account":"ACC-1001","to_account":"ACC-1002","amount":'
@@ -59,6 +66,7 @@ def test_nonfinite_json_number_is_a_validation_error(client, db_path, amount_lit
 
 
 def test_same_account_transfer_cannot_create_money(client, db_path):
+    """An account cannot receive a transfer from itself and gain money."""
     before = ledger_state(db_path)
     assert transfer(client, destination="ACC-1001").status_code == 422
     assert ledger_state(db_path) == before
@@ -66,6 +74,7 @@ def test_same_account_transfer_cannot_create_money(client, db_path):
 
 @pytest.mark.parametrize("key", ["", " ", "x" * 201])
 def test_invalid_retry_key_changes_nothing(client, db_path, key):
+    """Blank or overly long retry keys must be rejected without saving a transfer."""
     before = ledger_state(db_path)
     assert transfer(client, key=key).status_code == 422
     assert ledger_state(db_path) == before
@@ -75,6 +84,7 @@ def test_invalid_retry_key_changes_nothing(client, db_path, key):
     "1000000000000", "0.001", "-1", "NaN", "Infinity", "invalid", float("inf")
 ])
 def test_invalid_stored_balance_is_not_used(client, db_path, balance):
+    """Stop the transfer if an existing balance is invalid; do not silently fix it."""
     with closing(connect(db_path)) as connection:
         connection.execute("UPDATE accounts SET balance = ? WHERE id = 'ACC-1002'", (balance,))
         connection.commit()
@@ -84,6 +94,7 @@ def test_invalid_stored_balance_is_not_used(client, db_path, balance):
 
 
 def test_destination_balance_limit_changes_nothing(client, db_path):
+    """Reject a credit above the supported balance limit before debiting the sender."""
     with closing(connect(db_path)) as connection:
         connection.execute("UPDATE accounts SET balance = 999999999999.99 WHERE id = 'ACC-1002'")
         connection.commit()
@@ -94,6 +105,7 @@ def test_destination_balance_limit_changes_nothing(client, db_path):
 
 @pytest.mark.parametrize("cents", [1, 7, 29, 49, 99])
 def test_cent_transfer_at_supported_balance_limit_is_exact(client, db_path, cents):
+    """Small transfers must still keep every cent when the source balance is large."""
     with closing(connect(db_path)) as connection:
         connection.execute("UPDATE accounts SET balance = 999999999999.99 WHERE id = 'ACC-1001'")
         connection.commit()
@@ -110,6 +122,7 @@ def test_cent_transfer_at_supported_balance_limit_is_exact(client, db_path, cent
 
 @pytest.mark.parametrize("failure_stage", ["credit", "transfer", "second_entry"])
 def test_failure_at_each_write_stage_rolls_back(client, db_path, failure_stage):
+    """Force a failure at each listed write stage and check that nothing is saved."""
     # Only fixed test-owned SQL fragments are used in this trigger definition.
     triggers = {
         "credit": "BEFORE UPDATE ON accounts WHEN NEW.id = 'ACC-1002'",
@@ -134,9 +147,12 @@ def test_failure_at_each_write_stage_rolls_back(client, db_path, failure_stage):
 
 @pytest.mark.parametrize("same_key", [False, True])
 def test_concurrent_requests_conserve_money(client, db_path, same_key):
+    """Two overlapping requests must not spend the same funds or apply a retry twice."""
+    # Both workers wait here so neither starts its request before the other is ready.
     start = Barrier(2)
 
     def make_request():
+        """Wait for the other worker, then send this worker's transfer request."""
         start.wait(timeout=10)
         return transfer(client, 750, key="shared-key" if same_key else None)
 
@@ -144,6 +160,8 @@ def test_concurrent_requests_conserve_money(client, db_path, same_key):
         futures = [executor.submit(make_request) for _ in range(2)]
         responses = [future.result(timeout=15) for future in futures]
 
+    # One key means one transfer and two successful responses. Without a key,
+    # one transfer succeeds and the other is rejected for insufficient funds.
     assert sorted(response.status_code for response in responses) == (
         [201, 201] if same_key else [201, 409]
     )
@@ -157,9 +175,11 @@ def test_concurrent_requests_conserve_money(client, db_path, same_key):
 
 @pytest.mark.parametrize("lock_stage", ["begin", "commit"])
 def test_busy_database_returns_retryable_error(client, db_path, lock_stage):
+    """A lock timeout must leave no changes and allow a later retry to succeed."""
     previous_dependency = app.dependency_overrides[get_conn]
 
     def impatient_connection():
+        """Use a short lock timeout so this test does not wait five seconds."""
         with closing(connect(db_path)) as connection:
             connection.execute("PRAGMA busy_timeout = 1")
             yield connection
@@ -181,10 +201,12 @@ def test_busy_database_returns_retryable_error(client, db_path, lock_stage):
         assert ledger_state(db_path) == before
         assert transfer(client, key="busy-retry").status_code == 201
     finally:
+        # Restore the normal connection provider even if an assertion fails.
         app.dependency_overrides[get_conn] = previous_dependency
 
 
 def test_declined_transfer_does_not_consume_retry_key(client, db_path):
+    """A rejected transfer should not reserve its key or prevent a corrected request."""
     before = ledger_state(db_path)
     assert transfer(client, 1001, key="declined").status_code == 409
     assert ledger_state(db_path) == before
@@ -192,6 +214,7 @@ def test_declined_transfer_does_not_consume_retry_key(client, db_path):
 
 
 def test_entire_balance_can_be_transferred(client):
+    """Spending exactly the available balance is allowed and leaves zero."""
     response = transfer(client, 1000)
     assert response.status_code == 201
     assert response.json()["from_balance"] == "0.00"
@@ -199,6 +222,7 @@ def test_entire_balance_can_be_transferred(client):
 
 
 def test_both_ledger_entries_match_transfer(client, db_path):
+    """Save one outgoing and one incoming entry with the same amount and transfer ID."""
     response = transfer(client, 12.34)
     assert response.status_code == 201
     with closing(connect(db_path)) as connection:

@@ -1,3 +1,5 @@
+"""Check that setting up database tables does not erase existing records."""
+
 import os
 import subprocess
 import sys
@@ -8,6 +10,7 @@ from app.db import connect
 
 
 def test_initialize_existing_database_preserves_records(tmp_path):
+    """Run the setup command twice against an old database and keep its account."""
     database_path = str(tmp_path / "existing.db")
     with closing(connect(database_path)) as connection:
         connection.execute(
@@ -19,6 +22,7 @@ def test_initialize_existing_database_preserves_records(tmp_path):
             ("existing", "Synthetic Client", "000000", 125.50),
         )
         connection.commit()
+    # Point the command at this test's database, never the local advisor.db.
     environment = {**os.environ, "ADVISOR_DB": database_path}
     for _ in range(2):
         result = subprocess.run(

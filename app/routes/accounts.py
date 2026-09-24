@@ -3,6 +3,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.db import get_conn
+from app.money import format_money, read_money
 
 router = APIRouter()
 
@@ -14,7 +15,11 @@ def get_account(account_id: str, conn: sqlite3.Connection = Depends(get_conn)):
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="account not found")
-    return {"id": row["id"], "client_name": row["client_name"], "balance": str(row["balance"])}
+    return {
+        "id": row["id"],
+        "client_name": row["client_name"],
+        "balance": format_money(read_money(row["balance"])),
+    }
 
 
 @router.get("/accounts/{account_id}/positions")
@@ -22,17 +27,23 @@ def get_positions(account_id: str, conn: sqlite3.Connection = Depends(get_conn))
     if conn.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone() is None:
         raise HTTPException(status_code=404, detail="account not found")
     positions = conn.execute(
-        "SELECT fund_code, units FROM positions WHERE account_id = ? ORDER BY fund_code", (account_id,)
+        """
+        SELECT positions.fund_code, positions.units, funds.name, funds.nav
+        FROM positions
+        JOIN funds ON funds.code = positions.fund_code
+        WHERE positions.account_id = ?
+        ORDER BY positions.fund_code
+        """,
+        (account_id,),
     ).fetchall()
     result = []
-    for p in positions:
-        fund = conn.execute("SELECT name, nav FROM funds WHERE code = ?", (p["fund_code"],)).fetchone()
+    for position in positions:
         result.append(
             {
-                "fund_code": p["fund_code"],
-                "fund_name": fund["name"],
-                "units": f"{p['units']:.4f}",
-                "market_value": f"{p['units'] * fund['nav']:.2f}",
+                "fund_code": position["fund_code"],
+                "fund_name": position["name"],
+                "units": f"{position['units']:.4f}",
+                "market_value": f"{position['units'] * position['nav']:.2f}",
             }
         )
     return {"account_id": account_id, "positions": result}
